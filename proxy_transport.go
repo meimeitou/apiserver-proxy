@@ -2,8 +2,11 @@ package apiserverproxy
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -19,7 +22,11 @@ func init() {
 type HTTPTransport struct {
 	TLS *reverseproxy.TLSConfig `json:"tls,omitempty"`
 
-	KubeConfig   string `json:"kubeconfig,omitempty"`
+	KubeConfig string `json:"kubeconfig,omitempty"`
+	// ^/api/.*/pods/.*/exec,^/api/.*/pods/.*/attach
+	RejectPaths []*regexp.Regexp `json:"reject_paths,omitempty"`
+	// ^localhost$,^127\.0\.0\.1$,^\[::1\]$
+	AcceptHosts  []*regexp.Regexp `json:"accept_hosts,omitempty"`
 	RoundTripper http.RoundTripper
 	Config       *rest.Config
 	logger       *zap.Logger
@@ -45,7 +52,7 @@ func (h *HTTPTransport) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-func (h *HTTPTransport) SetScheme(req *http.Request) {
+func (h *HTTPTransport) SetRequest(req *http.Request) {
 	u, _ := url.Parse(h.Config.Host)
 	req.URL.Scheme = u.Scheme
 	req.URL.Host = u.Host
@@ -56,9 +63,40 @@ func (h *HTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if h.Config.BearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+h.Config.BearerToken)
 	}
-	h.SetScheme(req)
 	h.logger.Info("request", zap.String("req", fmt.Sprintf("%+v", req)))
+	h.SetRequest(req)
+	if !h.RequestAccept(req) {
+		resp := &http.Response{
+			Status:     "200 OK",
+			StatusCode: 403,
+			Proto:      "HTTP/1.1",
+			ProtoMajor: 1,
+			ProtoMinor: 1,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`RBAC Unauthorized`)),
+		}
+		return resp, nil
+	}
 	return h.RoundTripper.RoundTrip(req)
+}
+
+func (h *HTTPTransport) RequestAccept(req *http.Request) bool {
+	if len(h.RejectPaths) > 0 {
+		for _, reg := range h.RejectPaths {
+			if reg.MatchString(req.URL.Path) {
+				return false
+			}
+		}
+	}
+	if len(h.AcceptHosts) > 0 {
+		for _, reg := range h.AcceptHosts {
+			if reg.MatchString(req.Host) {
+				return true
+			}
+		}
+		return false
+	}
+	return true
 }
 
 // TLSEnabled returns true if TLS is enabled.
